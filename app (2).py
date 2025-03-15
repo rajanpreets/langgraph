@@ -183,14 +183,14 @@ def report_node(state: PharmaResearchState) -> PharmaResearchState:
 
 # Build workflow
 workflow = StateGraph(PharmaResearchState)
-workflow.add_node("search", search_node)
-workflow.add_node("process", process_node)
-workflow.add_node("report", report_node)
+workflow.add_node("search_data", search_node)  # Renamed
+workflow.add_node("process_data", process_node)  # Renamed
+workflow.add_node("generate_report", report_node)  # Renamed
 
-workflow.set_entry_point("search")
-workflow.add_edge("search", "process")
-workflow.add_edge("process", "report")
-workflow.add_edge("report", END)
+workflow.set_entry_point("search_data")
+workflow.add_edge("search_data", "process_data")
+workflow.add_edge("process_data", "generate_report")
+workflow.add_edge("generate_report", END)
 
 app = workflow.compile()
 
