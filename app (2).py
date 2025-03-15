@@ -1,11 +1,13 @@
 import streamlit as st
 import requests
 import pandas as pd
+import json
 from langgraph.graph import StateGraph, END
 from langchain.chat_models import ChatOpenAI
 from langchain.schema import HumanMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from typing import Dict, Any, List, Optional
+from datetime import datetime
 
 # Configuration
 SERPER_API_URL = "https://google.serper.dev/search"
@@ -16,29 +18,26 @@ DEFAULT_COLUMNS = ['nctId', 'title', 'status', 'phase', 'interventions', 'start_
 # Pydantic State Model
 # --------------------------
 
-class PharmaResearchState(BaseModel):
-    search_type: str = Field(default="news")
-    query: Optional[str] = Field(default=None)
-    time_filter: str = Field(default="1 Week")
+class PharmaState(BaseModel):
+    search_type: str = "news"
+    query: Optional[str] = None
+    time_filter: str = "1 Week"
     news_raw: List[Dict] = Field(default_factory=list)
-    clinical_raw: pd.DataFrame = Field(default_factory=lambda: pd.DataFrame(columns=DEFAULT_COLUMNS))
+    clinical_raw: List[Dict] = Field(default_factory=list)  # Store as list of dicts
     news_processed: Dict[str, Any] = Field(default_factory=dict)
     clinical_processed: Dict[str, Any] = Field(default_factory=dict)
-    report: Optional[str] = Field(default=None)
-
-    class Config:
-        arbitrary_types_allowed = True
+    report: Optional[str] = None
 
 # --------------------------
 # Core Functionality
 # --------------------------
 
 def sanitize_input(text: str) -> str:
-    """Sanitize user input for API queries"""
-    return text.strip('"\'').split('(')[0].strip().replace('"', '')
+    """Clean user input for API safety"""
+    return text.strip('"\'').split('(')[0].strip()
 
-def serper_news_search(query: str, api_key: str, time_filter: str) -> List[Dict]:
-    """Search news with Serper API"""
+def serper_search(query: str, api_key: str, time_filter: str) -> List[Dict]:
+    """Search news using Serper API"""
     time_map = {
         "1 Week": "qdr:w",
         "1 Month": "qdr:m",
@@ -49,7 +48,7 @@ def serper_news_search(query: str, api_key: str, time_filter: str) -> List[Dict]
     
     headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
     payload = {
-        "q": f"{query} pharmaceutical",
+        "q": f"{sanitize_input(query)} pharmaceutical",
         "tbm": "nws",
         "num": 10,
         "tbs": time_map.get(time_filter, "")
@@ -60,12 +59,12 @@ def serper_news_search(query: str, api_key: str, time_filter: str) -> List[Dict]
         response.raise_for_status()
         return response.json().get('newsResults', [])
     except Exception as e:
-        st.error(f"News search failed: {str(e)}")
+        st.error(f"News search error: {str(e)}")
         return []
 
-def get_clinical_trials(search_term: str) -> pd.DataFrame:
-    """Fetch and normalize clinical trials data"""
-    params = {"query.term": sanitize_input(search_term), "pageSize": 100}
+def fetch_clinical_trials(term: str) -> List[Dict]:
+    """Fetch clinical trials data and return as list of dicts"""
+    params = {"query.term": sanitize_input(term), "pageSize": 100}
     all_studies = []
     
     try:
@@ -73,17 +72,15 @@ def get_clinical_trials(search_term: str) -> pd.DataFrame:
             response = requests.get(CLINICAL_TRIALS_API, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
-            studies = data.get('studies', [])
-            if not studies:
-                break
-            all_studies.extend(studies)
-            if not data.get('nextPageToken'):
-                break
-            params['pageToken'] = data['nextPageToken']
+            all_studies.extend(data.get('studies', []))
+            
+            page_token = data.get('nextPageToken')
+            if not page_token: break
+            params['pageToken'] = page_token
     except Exception as e:
-        st.error(f"Clinical trials fetch failed: {str(e)}")
-        return pd.DataFrame(columns=DEFAULT_COLUMNS)
-
+        st.error(f"Clinical trials error: {str(e)}")
+        return []
+    
     normalized = []
     for study in all_studies:
         protocol = study.get('protocolSection', {})
@@ -100,125 +97,102 @@ def get_clinical_trials(search_term: str) -> pd.DataFrame:
             'completion_date': protocol.get('statusModule', {}).get('completionDateStruct', {}).get('date')
         })
     
-    return pd.DataFrame(normalized) if normalized else pd.DataFrame(columns=DEFAULT_COLUMNS)
+    return normalized
 
-def process_news(items: List[Dict], openai_key: str) -> Dict:
-    """Categorize and summarize news with GPT-4"""
-    if not items:
-        return {}
+def analyze_news(items: List[Dict], api_key: str) -> Dict:
+    """Categorize and summarize news using AI"""
+    if not items: return {}
     
     try:
-        chat = ChatOpenAI(model="gpt-4-turbo", temperature=0, openai_api_key=openai_key)
-        categories = {
-            "Regulatory": [],
-            "Commercialization": [],
-            "Clinical Development": []
-        }
+        chat = ChatOpenAI(model="gpt-4-turbo", temperature=0, openai_api_key=api_key)
+        categories = {"Regulatory": [], "Commercialization": [], "Clinical": []}
         
         for item in items:
-            try:
-                response = chat.invoke([
-                    HumanMessage(f"Categorize:\n{item['title']}\n{item['snippet']}\nOptions: {', '.join(categories.keys())}")
-                ])
-                category = response.content.strip()
-                if category in categories:
-                    categories[category].append(item)
-            except Exception as e:
-                st.error(f"News categorization failed: {str(e)}")
-                continue
+            response = chat.invoke([HumanMessage(
+                f"Categorize:\n{item['title']}\n{item['snippet']}\nOptions: {', '.join(categories.keys())}"
+            )])
+            category = response.content.strip()
+            if category in categories:
+                categories[category].append(item)
         
         for cat, items in categories.items():
             if items:
-                try:
-                    summary = chat.invoke([
-                        HumanMessage(f"Summarize these {cat} updates in 3 bullet points: {items}")
-                    ])
-                    categories[cat] = summary.content
-                except Exception as e:
-                    st.error(f"Summary generation failed for {cat}: {str(e)}")
-                    categories[cat] = "Summary unavailable"
-        
+                summary = chat.invoke([HumanMessage(
+                    f"Summarize {cat} updates in 3 bullet points: {items}"
+                )])
+                categories[cat] = summary.content
+                
         return categories
     except Exception as e:
-        st.error(f"News processing failed: {str(e)}")
+        st.error(f"Analysis failed: {str(e)}")
         return {}
 
 # --------------------------
 # LangGraph Workflow
 # --------------------------
 
-def search_node(state: PharmaResearchState) -> dict:
+def search_step(state: PharmaState) -> PharmaState:
     """Execute search based on type"""
+    if not state.query or not state.query.strip():
+        st.error("Please enter valid search terms")
+        return state
+    
     try:
-        clean_query = sanitize_input(state.query) if state.query else ""
-        if not clean_query:
-            st.error("Please enter a valid search query")
-            return state.model_dump()
-        
-        new_state = state.model_dump()
-        
         if state.search_type == "news":
-            new_state['news_raw'] = serper_news_search(
-                clean_query,
+            state.news_raw = serper_search(
+                state.query,
                 st.secrets["SERPER_API_KEY"],
                 state.time_filter
             )
         else:
-            clinical_data = get_clinical_trials(clean_query)
-            new_state['clinical_raw'] = clinical_data.to_dict(orient='list')
-        
-        return new_state
+            state.clinical_raw = fetch_clinical_trials(state.query)
+        return state
     except Exception as e:
-        st.error(f"Search failed: {str(e)}")
-        return state.model_dump()
+        st.error(f"Search error: {str(e)}")
+        return state
 
-def process_node(state: dict) -> dict:
+def process_step(state: PharmaState) -> PharmaState:
     """Process search results"""
     try:
-        new_state = state.copy()
-        
-        if state['search_type'] == "news":
-            new_state['news_processed'] = process_news(
-                state['news_raw'],
+        if state.search_type == "news":
+            state.news_processed = analyze_news(
+                state.news_raw,
                 st.secrets["OPENAI_API_KEY"]
             )
         else:
-            clinical_df = pd.DataFrame(state['clinical_raw'])
-            new_state['clinical_processed'] = {
-                "total_trials": len(clinical_df),
-                "phases": clinical_df['phase'].value_counts().to_dict(),
-                "statuses": clinical_df['status'].value_counts().to_dict()
+            df = pd.DataFrame(state.clinical_raw)
+            state.clinical_processed = {
+                "total": len(df),
+                "phases": df['phase'].value_counts().to_dict(),
+                "statuses": df['status'].value_counts().to_dict()
             }
-        
-        return new_state
+        return state
     except Exception as e:
-        st.error(f"Processing failed: {str(e)}")
+        st.error(f"Processing error: {str(e)}")
         return state
 
-def report_node(state: dict) -> dict:
+def report_step(state: PharmaState) -> PharmaState:
     """Generate final report"""
     try:
-        new_state = state.copy()
-        chat = ChatOpenAI(model="gpt-4-turbo", temperature=0.2, openai_api_key=st.secrets["OPENAI_API_KEY"])
+        chat = ChatOpenAI(model="gpt-4-turbo", temperature=0.2, 
+                         openai_api_key=st.secrets["OPENAI_API_KEY"])
         
-        if state['search_type'] == "news":
-            prompt = f"Generate pharmaceutical industry report with markdown formatting based on: {state['news_processed']}"
+        if state.search_type == "news":
+            prompt = f"Generate pharma industry report with markdown:\n{state.news_processed}"
         else:
-            prompt = f"Analyze clinical trials data and create professional report: {state['clinical_processed']}"
+            prompt = f"Analyze clinical trials data:\n{state.clinical_processed}"
         
-        response = chat.invoke([HumanMessage(prompt)])
-        new_state['report'] = response.content
-        
-        return new_state
+        state.report = chat.invoke([HumanMessage(prompt)]).content
+        return state
     except Exception as e:
-        st.error(f"Report generation failed: {str(e)}")
+        st.error(f"Reporting error: {str(e)}")
         return state
 
 # Build workflow
-workflow = StateGraph(PharmaResearchState)
-workflow.add_node("search", search_node)
-workflow.add_node("process", process_node)
-workflow.add_node("report", report_node)
+workflow = StateGraph(PharmaState)
+workflow.add_node("search", search_step)
+workflow.add_node("process", process_step)
+workflow.add_node("report", report_step)
 
 workflow.set_entry_point("search")
 workflow.add_edge("search", "process")
@@ -228,7 +202,7 @@ workflow.add_edge("report", END)
 app = workflow.compile()
 
 # --------------------------
-# Streamlit UI
+# Streamlit Interface
 # --------------------------
 
 st.set_page_config(
@@ -239,72 +213,77 @@ st.set_page_config(
 
 # Initialize session state
 if 'state' not in st.session_state:
-    st.session_state.state = PharmaResearchState().model_dump()
+    st.session_state.state = PharmaState().model_dump()
 
 # Sidebar Configuration
 with st.sidebar:
     st.title("Configuration")
-    
     search_type = st.radio(
-        "Search Type", 
-        ["News", "Clinical Trials"],
-        index=0 if st.session_state.state.get('search_type') == "news" else 1
+        "Search Type", ["News", "Clinical Trials"],
+        index=0 if st.session_state.state['search_type'] == "news" else 1
     )
-    st.session_state.state['search_type'] = search_type
-    
-    if search_type == "News":
-        time_filter = st.selectbox(
-            "Time Filter",
-            ["1 Week", "1 Month", "3 Months", "6 Months", "1 Year"],
-            index=1
-        )
-        st.session_state.state['time_filter'] = time_filter
+    time_filter = st.selectbox(
+        "Time Filter", ["1 Week", "1 Month", "3 Months", "6 Months", "1 Year"],
+        index=1
+    ) if search_type == "News" else "1 Week"
 
 # Main Interface
-st.title("Pharma Research Intelligence Platform")
+st.title("Pharma Research Platform")
 
+# Search Input
 query = st.text_input("Enter search keywords:", key="search_input")
 if st.button("Run Analysis"):
-    st.session_state.state['query'] = query
+    if not query.strip():
+        st.error("Please enter search terms")
+        st.stop()
+    
+    # Prepare fresh state
+    new_state = PharmaState(
+        search_type=search_type.lower(),
+        query=query.strip(),
+        time_filter=time_filter,
+        news_raw=[],
+        clinical_raw=[],
+        news_processed={},
+        clinical_processed={},
+        report=None
+    )
     
     try:
-        # Validate input state
-        validated_state = PharmaResearchState(**st.session_state.state)
-        
         # Execute workflow
-        final_state = None
-        for output in app.stream(validated_state):
-            final_state = output
+        for step in app.stream(new_state):
+            node_name, node_state = next(iter(step.items()))
+            st.session_state.state = node_state.model_dump()
         
-        if final_state:
-            st.session_state.state = final_state.model_dump()
-            st.success("Analysis completed successfully!")
-        
+        st.success("Analysis completed successfully!")
+    except ValidationError as e:
+        st.error(f"Validation error: {e}")
     except Exception as e:
-        st.error(f"Analysis failed: {str(e)}")
-        st.session_state.state = PharmaResearchState().model_dump()
+        st.error(f"Analysis failed: {e}")
 
 # Display Results
 if st.session_state.state.get('report'):
     st.subheader("Analysis Report")
     st.markdown(st.session_state.state['report'])
     
+    # Download Options
     col1, col2 = st.columns(2)
     with col1:
-        if st.session_state.state['search_type'] == "News":
+        if st.session_state.state['search_type'] == "news":
             st.download_button(
                 "Download News Data",
-                pd.DataFrame(st.session_state.state['news_raw']).to_csv(),
-                "news_results.csv"
+                data=pd.DataFrame(st.session_state.state['news_raw']).to_csv(),
+                file_name="news_results.csv"
             )
     with col2:
-        if st.session_state.state['search_type'] == "Clinical Trials":
+        if st.session_state.state['search_type'] == "clinical_trials":
             st.download_button(
                 "Download Clinical Data",
-                pd.DataFrame(st.session_state.state['clinical_raw']).to_csv(),
-                "clinical_trials.csv"
+                data=pd.DataFrame(st.session_state.state['clinical_raw']).to_csv(),
+                file_name="clinical_trials.csv"
             )
 
+# Footer
 st.markdown("---")
 st.markdown("""
 <style>
@@ -317,6 +296,6 @@ st.markdown("""
 }
 </style>
 <div class="footer">
-    <p>🔒 Secure Processing | 📊 Professional Reporting | 💊 Pharma Intelligence Suite</p>
+    <p>Pharma Intelligence Suite | Secure Processing | Professional Reporting</p>
 </div>
 """, unsafe_allow_html=True)
