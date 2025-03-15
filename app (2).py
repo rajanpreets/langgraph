@@ -16,7 +16,6 @@ CLINICAL_TRIALS_API = "https://clinicaltrials.gov/api/v2/studies"
 # --------------------------
 
 class PharmaResearchState(BaseModel):
-    api_keys: Dict[str, str] = Field(default_factory=dict)
     search_type: str = "news"
     query: Optional[str] = None
     time_filter: str = "1 Week"
@@ -79,7 +78,7 @@ def get_clinical_trials(search_term: str) -> pd.DataFrame:
             params['pageToken'] = data['nextPageToken']
     except Exception as e:
         st.error(f"Clinical trials fetch failed: {str(e)}")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=['nctId', 'title', 'status', 'phase', 'interventions', 'start_date', 'completion_date'])
 
     normalized = []
     for study in all_studies:
@@ -143,7 +142,7 @@ def search_node(state: PharmaResearchState) -> PharmaResearchState:
         if state.search_type == "news":
             state.news_raw = serper_news_search(
                 clean_query,
-                state.api_keys["serper"],
+                st.secrets["SERPER_API_KEY"],
                 state.time_filter
             )
         else:
@@ -159,7 +158,7 @@ def process_node(state: PharmaResearchState) -> PharmaResearchState:
         if state.search_type == "news":
             state.news_processed = process_news(
                 state.news_raw,
-                state.api_keys["openai"]
+                st.secrets["OPENAI_API_KEY"]
             )
         else:
             state.clinical_processed = {
@@ -175,7 +174,7 @@ def process_node(state: PharmaResearchState) -> PharmaResearchState:
 def report_node(state: PharmaResearchState) -> PharmaResearchState:
     """Generate final report"""
     try:
-        chat = ChatOpenAI(model="gpt-4-turbo", temperature=0.2, openai_api_key=state.api_keys["openai"])
+        chat = ChatOpenAI(model="gpt-4-turbo", temperature=0.2, openai_api_key=st.secrets["OPENAI_API_KEY"])
         
         if state.search_type == "news":
             prompt = f"Generate comprehensive pharmaceutical industry report with markdown formatting based on: {state.news_processed}"
@@ -215,30 +214,9 @@ st.set_page_config(
 if 'state' not in st.session_state:
     st.session_state.state = PharmaResearchState().dict()
 
-# Load secrets
-secrets_available = all(k in st.secrets for k in ["SERPER_API_KEY", "OPENAI_API_KEY"])
-
 # Sidebar Configuration
 with st.sidebar:
     st.title("Configuration")
-    
-    # API Keys from secrets or input
-    if secrets_available:
-        st.session_state.state['api_keys']['serper'] = st.secrets["SERPER_API_KEY"]
-        st.session_state.state['api_keys']['openai'] = st.secrets["OPENAI_API_KEY"]
-        st.success("API keys loaded from secrets")
-    else:
-        st.warning("Using manual API input (store secrets for production)")
-        st.session_state.state['api_keys']['serper'] = st.text_input(
-            "Serper API Key", 
-            type="password",
-            value=st.session_state.state['api_keys'].get('serper', '')
-        )
-        st.session_state.state['api_keys']['openai'] = st.text_input(
-            "OpenAI API Key", 
-            type="password",
-            value=st.session_state.state['api_keys'].get('openai', '')
-        )
     
     # Search Parameters
     st.session_state.state['search_type'] = st.radio(
@@ -260,25 +238,22 @@ st.title("Pharma Research Intelligence Platform")
 # Search Input
 query = st.text_input("Enter search keywords:", key="search_input")
 if st.button("Run Analysis"):
-    if not all(st.session_state.state['api_keys'].values()):
-        st.error("Please provide all API keys")
-    else:
-        try:
-            # Update and validate state
-            st.session_state.state['query'] = query
-            validated_state = PharmaResearchState(**st.session_state.state)
-            
-            # Execute workflow
-            for step in app.stream(validated_state):
-                node_name, node_state = next(iter(step.items()))
-                st.session_state.state = node_state.dict()
-            
-            st.success("Analysis complete!")
-            
-        except ValidationError as e:
-            st.error(f"Invalid data format: {str(e)}")
-        except Exception as e:
-            st.error(f"Analysis failed: {str(e)}")
+    try:
+        # Update state
+        st.session_state.state['query'] = query
+        validated_state = PharmaResearchState(**st.session_state.state)
+        
+        # Execute workflow
+        for step in app.stream(validated_state):
+            node_name, node_state = next(iter(step.items()))
+            st.session_state.state = node_state.dict()
+        
+        st.success("Analysis complete!")
+        
+    except ValidationError as e:
+        st.error(f"Invalid data format: {str(e)}")
+    except Exception as e:
+        st.error(f"Analysis failed: {str(e)}")
 
 # Display Results
 if st.session_state.state.get('report'):
