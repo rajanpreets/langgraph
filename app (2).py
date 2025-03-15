@@ -10,6 +10,7 @@ from typing import Dict, Any, List, Optional
 # Configuration
 SERPER_API_URL = "https://google.serper.dev/search"
 CLINICAL_TRIALS_API = "https://clinicaltrials.gov/api/v2/studies"
+DEFAULT_COLUMNS = ['nctId', 'title', 'status', 'phase', 'interventions', 'start_date', 'completion_date']
 
 # --------------------------
 # Pydantic State Model
@@ -20,7 +21,7 @@ class PharmaResearchState(BaseModel):
     query: Optional[str] = None
     time_filter: str = "1 Week"
     news_raw: List[Dict] = Field(default_factory=list)
-    clinical_raw: pd.DataFrame = Field(default_factory=pd.DataFrame)
+    clinical_raw: pd.DataFrame = Field(default_factory=lambda: pd.DataFrame(columns=DEFAULT_COLUMNS))
     news_processed: Dict[str, Any] = Field(default_factory=dict)
     clinical_processed: Dict[str, Any] = Field(default_factory=dict)
     report: Optional[str] = None
@@ -34,7 +35,7 @@ class PharmaResearchState(BaseModel):
 
 def sanitize_input(text: str) -> str:
     """Sanitize user input for API queries"""
-    return text.strip('"\'').split('(')[0].strip()
+    return text.strip('"\'').split('(')[0].strip().replace('"', '')
 
 def serper_news_search(query: str, api_key: str, time_filter: str) -> List[Dict]:
     """Search news with Serper API"""
@@ -55,7 +56,7 @@ def serper_news_search(query: str, api_key: str, time_filter: str) -> List[Dict]
     }
     
     try:
-        response = requests.post(SERPER_API_URL, headers=headers, json=payload)
+        response = requests.post(SERPER_API_URL, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
         return response.json().get('newsResults', [])
     except Exception as e:
@@ -69,7 +70,7 @@ def get_clinical_trials(search_term: str) -> pd.DataFrame:
     
     try:
         while True:
-            response = requests.get(CLINICAL_TRIALS_API, params=params)
+            response = requests.get(CLINICAL_TRIALS_API, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
             all_studies.extend(data.get('studies', []))
@@ -78,7 +79,7 @@ def get_clinical_trials(search_term: str) -> pd.DataFrame:
             params['pageToken'] = data['nextPageToken']
     except Exception as e:
         st.error(f"Clinical trials fetch failed: {str(e)}")
-        return pd.DataFrame(columns=['nctId', 'title', 'status', 'phase', 'interventions', 'start_date', 'completion_date'])
+        return pd.DataFrame(columns=DEFAULT_COLUMNS)
 
     normalized = []
     for study in all_studies:
@@ -96,40 +97,36 @@ def get_clinical_trials(search_term: str) -> pd.DataFrame:
             'completion_date': protocol.get('statusModule', {}).get('completionDateStruct', {}).get('date')
         })
     
-    return pd.DataFrame(normalized)
+    return pd.DataFrame(normalized) if normalized else pd.DataFrame(columns=DEFAULT_COLUMNS)
 
 def process_news(items: List[Dict], openai_key: str) -> Dict:
     """Categorize and summarize news with GPT-4"""
     if not items:
         return {}
     
-    chat = ChatOpenAI(model="gpt-4-turbo", temperature=0, openai_api_key=openai_key)
-    categories = {"Regulatory": [], "Commercialization": [], "Clinical Development": []}
-    
-    for item in items:
-        try:
+    try:
+        chat = ChatOpenAI(model="gpt-4-turbo", temperature=0, openai_api_key=openai_key)
+        categories = {"Regulatory": [], "Commercialization": [], "Clinical Development": []}
+        
+        for item in items:
             response = chat.invoke([
                 HumanMessage(f"Categorize:\n{item['title']}\n{item['snippet']}\nOptions: {', '.join(categories.keys())}")
             ])
             category = response.content.strip()
             if category in categories:
                 categories[category].append(item)
-        except Exception as e:
-            st.error(f"News processing failed: {str(e)}")
-            continue
-    
-    for cat, items in categories.items():
-        if items:
-            try:
+        
+        for cat, items in categories.items():
+            if items:
                 summary = chat.invoke([
                     HumanMessage(f"Summarize these {cat} updates in 3 bullet points: {items}")
                 ])
                 categories[cat] = summary.content
-            except Exception as e:
-                st.error(f"Summary generation failed: {str(e)}")
-                categories[cat] = "Summary unavailable"
-    
-    return categories
+                
+        return categories
+    except Exception as e:
+        st.error(f"News processing failed: {str(e)}")
+        return {}
 
 # --------------------------
 # LangGraph Workflow
@@ -139,6 +136,10 @@ def search_node(state: PharmaResearchState) -> PharmaResearchState:
     """Execute search based on type"""
     try:
         clean_query = sanitize_input(state.query) if state.query else ""
+        if not clean_query:
+            st.error("Please enter a valid search query")
+            return state
+            
         if state.search_type == "news":
             state.news_raw = serper_news_search(
                 clean_query,
@@ -163,8 +164,8 @@ def process_node(state: PharmaResearchState) -> PharmaResearchState:
         else:
             state.clinical_processed = {
                 "total_trials": len(state.clinical_raw),
-                "phases": state.clinical_raw['phase'].value_counts().to_dict(),
-                "statuses": state.clinical_raw['status'].value_counts().to_dict()
+                "phases": state.clinical_raw['phase'].value_counts().to_dict() if not state.clinical_raw.empty else {},
+                "statuses": state.clinical_raw['status'].value_counts().to_dict() if not state.clinical_raw.empty else {}
             }
         return state
     except Exception as e:
@@ -212,7 +213,7 @@ st.set_page_config(
 
 # Initialize session state
 if 'state' not in st.session_state:
-    st.session_state.state = PharmaResearchState().dict()
+    st.session_state.state = PharmaResearchState().model_dump()
 
 # Sidebar Configuration
 with st.sidebar:
@@ -246,7 +247,7 @@ if st.button("Run Analysis"):
         # Execute workflow
         for step in app.stream(validated_state):
             node_name, node_state = next(iter(step.items()))
-            st.session_state.state = node_state.dict()
+            st.session_state.state = node_state.model_dump()
         
         st.success("Analysis complete!")
         
