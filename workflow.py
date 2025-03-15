@@ -1,6 +1,13 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from langgraph.graph import StateGraph
 from langchain.schema import AIMessage
-from tools import news_tools, clinical_trials  # Updated import
+from news_tools import serper_news_search, analyze_news
+from clinical_trials import get_clinical_trials_data, process_clinical_trials
+
+# Rest of your workflow code remains the same
 
 def workflow(state: dict) -> dict:
     """Main workflow decision function"""
