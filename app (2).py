@@ -1,11 +1,9 @@
 import streamlit as st
 import requests
 import pandas as pd
-from datetime import datetime
-from dateutil.parser import parse, ParserError
 from langgraph.graph import StateGraph, END
 from langchain.chat_models import ChatOpenAI
-from langchain.schema import HumanMessage, AIMessage
+from langchain.schema import HumanMessage
 from pydantic import BaseModel, Field, ValidationError
 from typing import Dict, Any, List, Optional
 
@@ -29,11 +27,15 @@ class PharmaResearchState(BaseModel):
     report: Optional[str] = None
 
     class Config:
-        arbitrary_types_allowed = True  # Allow pandas DataFrame
+        arbitrary_types_allowed = True
 
 # --------------------------
 # Core Functionality
 # --------------------------
+
+def sanitize_input(text: str) -> str:
+    """Sanitize user input for API queries"""
+    return text.strip('"\'').split('(')[0].strip()
 
 def serper_news_search(query: str, api_key: str, time_filter: str) -> List[Dict]:
     """Search news with Serper API"""
@@ -63,21 +65,22 @@ def serper_news_search(query: str, api_key: str, time_filter: str) -> List[Dict]
 
 def get_clinical_trials(search_term: str) -> pd.DataFrame:
     """Fetch and normalize clinical trials data"""
-    params = {"query.term": search_term, "pageSize": 100}
+    params = {"query.term": sanitize_input(search_term), "pageSize": 100}
     all_studies = []
     
-    while True:
-        try:
+    try:
+        while True:
             response = requests.get(CLINICAL_TRIALS_API, params=params)
+            response.raise_for_status()
             data = response.json()
             all_studies.extend(data.get('studies', []))
             if not data.get('nextPageToken'):
                 break
             params['pageToken'] = data['nextPageToken']
-        except Exception as e:
-            st.error(f"Clinical trials fetch failed: {str(e)}")
-            break
-    
+    except Exception as e:
+        st.error(f"Clinical trials fetch failed: {str(e)}")
+        return pd.DataFrame()
+
     normalized = []
     for study in all_studies:
         protocol = study.get('protocolSection', {})
@@ -98,6 +101,9 @@ def get_clinical_trials(search_term: str) -> pd.DataFrame:
 
 def process_news(items: List[Dict], openai_key: str) -> Dict:
     """Categorize and summarize news with GPT-4"""
+    if not items:
+        return {}
+    
     chat = ChatOpenAI(model="gpt-4-turbo", temperature=0, openai_api_key=openai_key)
     categories = {"Regulatory": [], "Commercialization": [], "Clinical Development": []}
     
@@ -133,14 +139,15 @@ def process_news(items: List[Dict], openai_key: str) -> Dict:
 def search_node(state: PharmaResearchState) -> PharmaResearchState:
     """Execute search based on type"""
     try:
+        clean_query = sanitize_input(state.query) if state.query else ""
         if state.search_type == "news":
             state.news_raw = serper_news_search(
-                state.query,
+                clean_query,
                 state.api_keys["serper"],
                 state.time_filter
             )
         else:
-            state.clinical_raw = get_clinical_trials(state.query)
+            state.clinical_raw = get_clinical_trials(clean_query)
         return state
     except Exception as e:
         st.error(f"Search failed: {str(e)}")
@@ -183,9 +190,9 @@ def report_node(state: PharmaResearchState) -> PharmaResearchState:
 
 # Build workflow
 workflow = StateGraph(PharmaResearchState)
-workflow.add_node("search_data", search_node)  # Renamed
-workflow.add_node("process_data", process_node)  # Renamed
-workflow.add_node("generate_report", report_node)  # Renamed
+workflow.add_node("search_data", search_node)
+workflow.add_node("process_data", process_node)
+workflow.add_node("generate_report", report_node)
 
 workflow.set_entry_point("search_data")
 workflow.add_edge("search_data", "process_data")
@@ -208,21 +215,30 @@ st.set_page_config(
 if 'state' not in st.session_state:
     st.session_state.state = PharmaResearchState().dict()
 
+# Load secrets
+secrets_available = all(k in st.secrets for k in ["SERPER_API_KEY", "OPENAI_API_KEY"])
+
 # Sidebar Configuration
 with st.sidebar:
     st.title("Configuration")
     
-    # API Keys
-    st.session_state.state['api_keys']['serper'] = st.text_input(
-        "Serper API Key", 
-        type="password",
-        value=st.session_state.state['api_keys'].get('serper', '')
-    )
-    st.session_state.state['api_keys']['openai'] = st.text_input(
-        "OpenAI API Key", 
-        type="password",
-        value=st.session_state.state['api_keys'].get('openai', '')
-    )
+    # API Keys from secrets or input
+    if secrets_available:
+        st.session_state.state['api_keys']['serper'] = st.secrets["SERPER_API_KEY"]
+        st.session_state.state['api_keys']['openai'] = st.secrets["OPENAI_API_KEY"]
+        st.success("API keys loaded from secrets")
+    else:
+        st.warning("Using manual API input (store secrets for production)")
+        st.session_state.state['api_keys']['serper'] = st.text_input(
+            "Serper API Key", 
+            type="password",
+            value=st.session_state.state['api_keys'].get('serper', '')
+        )
+        st.session_state.state['api_keys']['openai'] = st.text_input(
+            "OpenAI API Key", 
+            type="password",
+            value=st.session_state.state['api_keys'].get('openai', '')
+        )
     
     # Search Parameters
     st.session_state.state['search_type'] = st.radio(
@@ -248,14 +264,14 @@ if st.button("Run Analysis"):
         st.error("Please provide all API keys")
     else:
         try:
-            # Update state
+            # Update and validate state
             st.session_state.state['query'] = query
             validated_state = PharmaResearchState(**st.session_state.state)
             
             # Execute workflow
             for step in app.stream(validated_state):
-                node_name = list(step.keys())[0]
-                st.session_state.state = step[node_name].dict()
+                node_name, node_state = next(iter(step.items()))
+                st.session_state.state = node_state.dict()
             
             st.success("Analysis complete!")
             
