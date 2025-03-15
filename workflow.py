@@ -1,9 +1,8 @@
 from langgraph.graph import StateGraph
 from langchain.schema import AIMessage
-from typing import Dict, Any
-from . import news_tools, clinical_trials
+from tools import news_tools, clinical_trials  # Updated import
 
-def workflow(state: Dict[str, Any]) -> Dict[str, Any]:
+def workflow(state: dict) -> dict:
     """Main workflow decision function"""
     search_type = state.get("search_type", "news")
     api_keys = state["api_keys"]
