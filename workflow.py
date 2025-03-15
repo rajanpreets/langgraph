@@ -1,15 +1,12 @@
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from langgraph.graph import StateGraph
+from typing import Dict, Any
+from langgraph.graph import StateGraph, END
 from langchain.schema import AIMessage
+
+# Local imports
 from news_tools import serper_news_search, analyze_news
 from clinical_trials import get_clinical_trials_data, process_clinical_trials
 
-# Rest of your workflow code remains the same
-
-def workflow(state: dict) -> dict:
+def workflow(state: Dict[str, Any]) -> Dict[str, Any]:
     """Main workflow decision function"""
     search_type = state.get("search_type", "news")
     api_keys = state["api_keys"]
@@ -18,15 +15,15 @@ def workflow(state: dict) -> dict:
     if search_type == "news":
         news_results = {}
         for keyword in keywords:
-            news_results[keyword] = news_tools.serper_news_search(
+            news_results[keyword] = serper_news_search(
                 keyword, api_keys["serper"])
         state["news_raw"] = news_results
         
     elif search_type == "clinical":
         clinical_results = {}
         for keyword in keywords:
-            trials_df = clinical_trials.get_clinical_trials_data(keyword)
-            clinical_results[keyword] = clinical_trials.process_clinical_trials(trials_df)
+            trials_df = get_clinical_trials_data(keyword)
+            clinical_results[keyword] = process_clinical_trials(trials_df)
         state["clinical_raw"] = clinical_results
         
     return state
@@ -34,7 +31,7 @@ def workflow(state: dict) -> dict:
 def process_news(state: Dict[str, Any]) -> Dict[str, Any]:
     """Process news results"""
     state["news_processed"] = {
-        k: news_tools.analyze_news(v, state["api_keys"]["openai"])
+        k: analyze_news(v, state["api_keys"]["openai"])
         for k, v in state["news_raw"].items()
     }
     return state
