@@ -104,127 +104,80 @@ def process_news(news_items: List[Dict], openai_key: str) -> Dict:
             categories[cat] = response.content
             
     return categories
+# ... (keep previous imports and configuration)
 
 # --------------------------
-# LangGraph Workflow
+# State Management
 # --------------------------
 
-def search_node(state: Dict) -> Dict:
+class PharmaResearchState(BaseModel):
+    """Pydantic model for state validation"""
+    api_keys: Dict[str, str] = Field(default_factory=dict)
+    search_type: str = "news"
+    query: Optional[str] = None
+    news_raw: List[Dict] = Field(default_factory=list)
+    clinical_raw: pd.DataFrame = Field(default_factory=pd.DataFrame)
+    report: Optional[str] = None
+
+def init_state() -> PharmaResearchState:
+    """Initialize validated state"""
+    return PharmaResearchState(
+        api_keys=st.session_state.get('api_keys', {'serper': '', 'openai': ''}),
+        search_type=st.session_state.get('search_type', 'news'),
+        query=st.session_state.get('query', ''),
+        news_raw=st.session_state.get('news_raw', []),
+        clinical_raw=st.session_state.get('clinical_raw', pd.DataFrame()),
+        report=st.session_state.get('report', None)
+    )
+
+# --------------------------
+# Modified Workflow Nodes
+# --------------------------
+
+def search_node(state: PharmaResearchState) -> PharmaResearchState:
     """Execute search based on type"""
-    if state['search_type'] == 'news':
-        state['news_raw'] = serper_news_search(
-            state['query'],
-            state['api_keys']['serper'],
-            state['time_filter']
+    if state.search_type == 'news':
+        state.news_raw = serper_news_search(
+            state.query,
+            state.api_keys['serper'],
+            state.time_filter
         )
     else:
-        state['clinical_raw'] = get_clinical_trials(state['query'])
+        state.clinical_raw = get_clinical_trials(state.query)
     return state
 
-def process_node(state: Dict) -> Dict:
+def process_node(state: PharmaResearchState) -> PharmaResearchState:
     """Process search results"""
-    if state['search_type'] == 'news':
-        state['news_processed'] = process_news(
-            state['news_raw'],
-            state['api_keys']['openai']
+    if state.search_type == 'news':
+        state.report = process_news(
+            state.news_raw,
+            state.api_keys['openai']
         )
     else:
-        state['clinical_processed'] = state['clinical_raw'].to_dict()
+        state.report = analyze_clinical_trials(state.clinical_raw)
     return state
 
-def report_node(state: Dict) -> Dict:
-    """Generate final output"""
-    chat = ChatOpenAI(model="gpt-4-turbo", temperature=0.2, openai_api_key=state['api_keys']['openai'])
-    
-    if state['search_type'] == 'news':
-        prompt = f"Generate professional pharma report from: {state['news_processed']}"
-    else:
-        prompt = f"Analyze clinical trials data: {state['clinical_processed']}"
-    
-    state['report'] = chat.invoke([HumanMessage(prompt)]).content
-    return state
-
-# Build workflow
-workflow = StateGraph(dict)
-workflow.add_node("search", search_node)
-workflow.add_node("process", process_node)
-workflow.add_node("report", report_node)
-
-workflow.set_entry_point("search")
-workflow.add_edge("search", "process")
-workflow.add_edge("process", "report")
-workflow.add_edge("report", END)
-
-app = workflow.compile()
-
 # --------------------------
-# Streamlit UI
+# Updated Streamlit UI
 # --------------------------
 
-st.set_page_config(
-    page_title="Pharma Intelligence Suite",
-    layout="wide",
-    page_icon="🔬"
-)
-
-# Sidebar
-with st.sidebar:
-    st.title("Configuration")
-    st.session_state.state['api_keys']['serper'] = st.text_input(
-        "Serper API Key", type="password")
-    st.session_state.state['api_keys']['openai'] = st.text_input(
-        "OpenAI API Key", type="password")
-    
-    st.session_state.state['search_type'] = st.radio(
-        "Search Type", ["News", "Clinical Trials"])
-    
-    if st.session_state.state['search_type'] == "News":
-        st.session_state.state['time_filter'] = st.selectbox(
-            "Time Filter", ["1 Week", "1 Month", "3 Months", "6 Months", "1 Year"])
-
-# Main Interface
-st.title("Pharma Research Intelligence Platform")
-
-# Search Input
-query = st.text_input("Enter search keywords:", key="search_input")
 if st.button("Run Analysis"):
-    if not all(st.session_state.state['api_keys'].values()):
+    if not all(st.session_state.api_keys.values()):
         st.error("Please provide all API keys")
     else:
-        st.session_state.state['query'] = query
-        st.session_state.results = app.invoke(st.session_state.state)
-
-# Display Results
-if st.session_state.get('results'):
-    st.subheader("Analysis Report")
-    st.markdown(st.session_state.results['report'])
-    
-    if st.session_state.state['search_type'] == "News":
-        st.download_button(
-            label="Download News Data",
-            data=pd.DataFrame(st.session_state.results['news_raw']).to_csv(),
-            file_name="news_results.csv"
-        )
-    else:
-        st.download_button(
-            label="Download Clinical Data",
-            data=pd.DataFrame(st.session_state.results['clinical_processed']).to_csv(),
-            file_name="clinical_trials.csv"
-        )
-
-# Footer
-st.markdown("---")
-st.markdown("""
-<style>
-.footer {
-    text-align: center;
-    padding: 1rem;
-    position: relative;
-    bottom: 0;
-    width: 100%;
-}
-</style>
-<div class="footer">
-    <p>Pharma Intelligence Suite • Secure API Handling • Professional Reporting</p>
-</div>
-""", unsafe_allow_html=True)
+        try:
+            # Initialize validated state
+            state = init_state()
+            state.query = query
+            state.search_type = st.session_state.search_type.lower()
+            
+            # Execute workflow
+            for step in app.stream(state):
+                node_name = list(step.keys())[0]
+                st.session_state.state = step[node_name].dict()
+            
+            st.session_state.report = st.session_state.state['report']
+            
+        except ValidationError as e:
+            st.error(f"Validation error: {str(e)}")
+            st.stop()
