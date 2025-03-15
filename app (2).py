@@ -1,6 +1,9 @@
 import streamlit as st
 from workflow import app
 import session_state
+from workflow import app
+from tools.clinical_trials import get_clinical_trials_data  # Explicit import
+from tools.news_tools import serper_news_search, analyze_news  # Explicit import
 
 # Initialize session
 if 'state' not in st.session_state:
